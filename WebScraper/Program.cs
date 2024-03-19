@@ -40,42 +40,40 @@ Directory.CreateDirectory(outputDetailDir);
 Console.WriteLine("Scraping started...");
 UpdateProgressBar();
 
-while (true)
+while (visitedImages.Count < totalImages || visitedPages.Count < totalPages.Count || visitedDetailPages.Count < totalDetailPages)
 {
-    if (visitedImages.Count >= totalImages && visitedPages.Count() >= totalPages.Count() && visitedDetailPages.Count >= totalDetailPages)
-        break;
-
-    Parallel.ForEach(
-        totalPages,
-        new ParallelOptions { MaxDegreeOfParallelism = 5 },
-        async currentPage =>
-        {
-            await ScrapeUrl(currentPage, baseOutputDirectory);
-        }
-    );
-
-
-    if (!detailPageUrls.IsEmpty)
-    {
-
-        Parallel.ForEach(
-        detailPageUrls,
-        new ParallelOptions { MaxDegreeOfParallelism = 5 },
-        async detailPage =>
-        {
-            await ScrapeUrl(detailPage, outputDetailDir);
-        }
-        );
-    }
-
-    //Sadly I did not have time to go through copying the categories n such
+    ScrapePages();
 }
 
 Console.WriteLine("\nScraping completed.");
 Console.WriteLine("Press any key to exit...");
 Console.ReadLine();
 
-async Task ScrapeUrl(string url, string outputDirectory)
+void ScrapePages()
+{
+    var httpClient = new HttpClient();
+    Parallel.ForEach(
+    totalPages,
+    new ParallelOptions { MaxDegreeOfParallelism = 5 },
+    async currentPage =>
+    {
+        await ScrapeUrl(currentPage, baseOutputDirectory, httpClient);
+    }
+);
+    if (!detailPageUrls.IsEmpty)
+    {
+        Parallel.ForEach(
+        detailPageUrls,
+        new ParallelOptions { MaxDegreeOfParallelism = 5 },
+        async detailPage =>
+        {
+            await ScrapeUrl(detailPage, outputDetailDir, httpClient);
+        }
+        );
+    }
+}
+
+async Task ScrapeUrl(string url, string outputDirectory, HttpClient httpClient)
 {
     if (visitedPages.Contains(url))
     {
@@ -86,20 +84,19 @@ async Task ScrapeUrl(string url, string outputDirectory)
     //Mark the current page as visited
     visitedPages.Add(url);
 
-    var httpClient = new HttpClient();
     var html = await httpClient.GetStringAsync(url);
     var htmlDocument = new HtmlDocument();
     htmlDocument.LoadHtml(html);
     if (outputDirectory.Equals(baseOutputDirectory))
     {
         //For base pages, download resources and save the HTML document
-        await DownloadResources(htmlDocument, url);
+        await DownloadResources(htmlDocument, url, httpClient);
         SaveHtml(htmlDocument, url, outputDirectory);
     }
     else if (outputDirectory.Equals(outputDetailDir))
     {
         //For detail pages, save the HTML document directly
-        await DownloadResources(htmlDocument, url);
+        await DownloadResources(htmlDocument, url, httpClient);
         SaveDetailPage(htmlDocument, url, outputDirectory);
     }
 
@@ -155,9 +152,8 @@ void SaveHtml(HtmlDocument document, string url, string outputDirectory)
     }
 }
 
-async Task DownloadResources(HtmlDocument document, string url)
+async Task DownloadResources(HtmlDocument document, string url, HttpClient httpClient)
 {
-    var httpClient = new HttpClient();
     await DownloadImages(document, url, httpClient);
     await DownloadCssAndJs(document, url, httpClient);
 }
@@ -186,7 +182,7 @@ async Task DownloadImages(HtmlDocument document, string url, HttpClient httpClie
             }
         }
     }
-    ExtractDetaiPage(document, url);
+    ExtractDetaiPageUrls(document, url);
 }
 
 async Task DownloadCssAndJs(HtmlDocument document, string url, HttpClient httpClient)
@@ -225,7 +221,7 @@ async Task DownloadCssAndJs(HtmlDocument document, string url, HttpClient httpCl
     }
 }
 
-void ExtractDetaiPage(HtmlDocument document, string url)
+void ExtractDetaiPageUrls(HtmlDocument document, string url)
 {
     var detaiNodes = document.DocumentNode.SelectNodes("//h3/a[@href]");
     if (detaiNodes != null)
