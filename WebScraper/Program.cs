@@ -1,5 +1,6 @@
 ﻿using HtmlAgilityPack;
 using System.Collections.Concurrent;
+using System.Text;
 
 string baseOutputDirectory;
 do
@@ -8,136 +9,165 @@ do
     baseOutputDirectory = Console.ReadLine();
 } while (!Directory.Exists(baseOutputDirectory));
 
-
-//Init param
-int totalImages = 2000; //Books have a overview image and the detailimage so books*2
-int totalDetailPages = 1000;
-
 //HoldVisitedPages
 var visitedPages = new ConcurrentBag<string>();
-var visitedResources = new ConcurrentBag<string>();
-var visitedImages = new ConcurrentBag<string>();
-var visitedDetailPages = new ConcurrentBag<string>();
-var detailPageUrls = new ConcurrentBag<string>();
 
+var detailPageUrls = new ConcurrentBag<string>();
+var categoryUrls = new ConcurrentBag<string>();
 
 //ProgressBar
-object consoleLock = new();
-double lastProgress = 0.0;
+int totalTasks = 0;
+int completedTasks = 0;
+object progressLock = new object();
 
 
-var totalPages = new ConcurrentBag<String>();
+var baseProductPages = new ConcurrentBag<String>();
+var baseBookPages = new ConcurrentBag<String>();
+
 for (int i = 1; i < 51; i++)
 {
-    totalPages.Add($"https://books.toscrape.com/catalogue/category/books_1/page-{i}.html");
+    baseProductPages.Add($"https://books.toscrape.com/catalogue/page-{i}.html");
 }
 
-var outputDetailDir = Path.Combine(baseOutputDirectory, "catalogue");
 
-Directory.CreateDirectory(baseOutputDirectory);
-Directory.CreateDirectory(outputDetailDir);
+for (int i = 1; i < 51; i++)
+{
+    baseBookPages.Add($"https://books.toscrape.com/catalogue/category/books_1/page-{i}.html");
+}
 
 Console.WriteLine("Scraping started...");
-UpdateProgressBar();
 
-while (visitedImages.Count < totalImages || visitedPages.Count < totalPages.Count || visitedDetailPages.Count < totalDetailPages)
-{
-    ScrapePages();
-}
+await StartScraping();
 
-Console.WriteLine("\nScraping completed.");
-Console.WriteLine("Press any key to exit...");
+Console.WriteLine("Press enter to exit");
 Console.ReadLine();
 
-void ScrapePages()
+async Task StartScraping()
 {
     var httpClient = new HttpClient();
-    Parallel.ForEach(
-    totalPages,
-    new ParallelOptions { MaxDegreeOfParallelism = 5 },
-    async currentPage =>
+    var tasksQueue = new ConcurrentQueue<Task>();
+
+    try
     {
-        await ScrapeUrl(currentPage, baseOutputDirectory, httpClient);
-    }
-);
-    if (!detailPageUrls.IsEmpty)
-    {
-        Parallel.ForEach(
-        detailPageUrls,
-        new ParallelOptions { MaxDegreeOfParallelism = 5 },
-        async detailPage =>
+        EnqueueTask(ScrapeUrl("https://books.toscrape.com/index.html", httpClient), tasksQueue);
+        PopulateInitialTasks(httpClient, tasksQueue);
+
+        bool onGoing = true;
+        var progressBar = Task.Run(async () =>
         {
-            await ScrapeUrl(detailPage, outputDetailDir, httpClient);
-        }
-        );
+            while (completedTasks < totalTasks || !tasksQueue.IsEmpty || onGoing)
+            {
+                UpdateProgressBar(totalTasks, completedTasks);
+                await Task.Delay(1000);
+            }
+            UpdateProgressBar(totalTasks, completedTasks);
+        });
+
+        var manageTasks = Task.Run(async () =>
+        {
+            while (!tasksQueue.IsEmpty)
+            {
+                if (tasksQueue.TryDequeue(out var task))
+                {
+                    await task;
+                    ProcessNewUrls(httpClient, tasksQueue);
+                }
+                else
+                {
+                    await Task.Delay(1000);
+                }
+            }
+        });
+
+        await manageTasks;
+        onGoing = false;
+        await progressBar;
+
+    }
+    catch (Exception ex)
+    {
+        await Console.Out.WriteLineAsync(ex.Message);
     }
 }
 
-async Task ScrapeUrl(string url, string outputDirectory, HttpClient httpClient)
+void EnqueueTask(Task task, ConcurrentQueue<Task> queue)
+{
+    lock (progressLock)
+    {
+        totalTasks++;
+    }
+    queue.Enqueue(task.ContinueWith(t =>
+    {
+        lock (progressLock)
+        {
+            completedTasks++;
+        }
+    }));
+}
+
+void ProcessNewUrls(HttpClient httpClient, ConcurrentQueue<Task> tasksQueue)
+{
+    foreach (var page in detailPageUrls)
+    {
+        EnqueueTask(ScrapeUrl(page, httpClient), tasksQueue);
+        detailPageUrls.TryTake(out _);
+    }
+
+    foreach (var page in categoryUrls)
+    {
+        EnqueueTask(ScrapeUrl(page, httpClient), tasksQueue);
+        categoryUrls.TryTake(out _);
+    }
+}
+
+void PopulateInitialTasks(HttpClient httpClient, ConcurrentQueue<Task> queue)
+{
+    foreach (var url in baseProductPages)
+    {
+        queue.Enqueue(ScrapeUrl(url, httpClient));
+    }
+    foreach (var url in baseBookPages)
+    {
+        queue.Enqueue(ScrapeUrl(url, httpClient));
+    }
+}
+
+async Task ScrapeUrl(string url, HttpClient httpClient)
 {
     if (visitedPages.Contains(url))
     {
         //Skip visiting if already visited
         return;
     }
-
-    //Mark the current page as visited
     visitedPages.Add(url);
 
     var html = await httpClient.GetStringAsync(url);
     var htmlDocument = new HtmlDocument();
     htmlDocument.LoadHtml(html);
-    if (outputDirectory.Equals(baseOutputDirectory))
-    {
-        //For base pages, download resources and save the HTML document
-        await DownloadResources(htmlDocument, url, httpClient);
-        SaveHtml(htmlDocument, url, outputDirectory);
-    }
-    else if (outputDirectory.Equals(outputDetailDir))
-    {
-        //For detail pages, save the HTML document directly
-        await DownloadResources(htmlDocument, url, httpClient);
-        SaveDetailPage(htmlDocument, url, outputDirectory);
-    }
-
-    UpdateProgressBar();
+    await DownloadResources(htmlDocument, url, httpClient);
+    SaveHtml(htmlDocument, url);
+    ExtractCategoryUrls(htmlDocument, url);
+    ExtractDetaiPageUrls(htmlDocument, url);
 }
 
-void SaveDetailPage(HtmlDocument document, string url, string outputDirectory)
+void SaveHtml(HtmlDocument document, string url)
 {
     try
     {
         if (document != null && document.DocumentNode != null)
         {
-            var fileName = url.Substring(url.IndexOf("catalogue/") + "catalogue/".Length).TrimEnd('/').Replace("/index.html", "") + ".html";
-            var filePath = Path.Combine(outputDirectory, fileName);
+            var fileName = Path.GetFileName(url);
+            var basePath = url.Replace("https://books.toscrape.com", baseOutputDirectory);
+            var dirName = Path.GetDirectoryName(basePath);
 
-            UpdateHtmlContent(document);
+            if (!Directory.Exists(dirName))
+            {
+                Directory.CreateDirectory(dirName);
+            }
 
-            File.WriteAllText(filePath, document.DocumentNode.OuterHtml);
-            visitedDetailPages.Add(url);
-        }
-        else
-        {
-            Console.WriteLine("Error: Document or DocumentNode is null.");
-        }
-    }
-    catch (Exception ex)
-    {
-        Console.WriteLine($"Error saving HTML: {ex.Message}");
-    }
-}
+            var filePath = Path.Combine(dirName, fileName);
 
-void SaveHtml(HtmlDocument document, string url, string outputDirectory)
-{
-    try
-    {
-        if (document != null && document.DocumentNode != null)
-        {
-            var fileName = Path.GetFileName(url) + ".html";
-            var filePath = Path.Combine(outputDirectory, fileName);
-
-            UpdateHtmlContent(document);
+            UpdateHtmlContent(document, dirName);
 
             File.WriteAllText(filePath, document.DocumentNode.OuterHtml);
         }
@@ -154,68 +184,23 @@ void SaveHtml(HtmlDocument document, string url, string outputDirectory)
 
 async Task DownloadResources(HtmlDocument document, string url, HttpClient httpClient)
 {
-    await DownloadImages(document, url, httpClient);
-    await DownloadCssAndJs(document, url, httpClient);
+    await ImageDownloader.DownloadImages(document, url, httpClient, baseOutputDirectory);
+    await ResourceDownloader.DownloadCssAndJs(document, url, httpClient, baseOutputDirectory);
 }
 
-async Task DownloadImages(HtmlDocument document, string url, HttpClient httpClient)
+void ExtractCategoryUrls(HtmlDocument document, string url)
 {
-    var imageNodes = document.DocumentNode.SelectNodes("//img[@src]");
-    if (imageNodes != null)
+    var categoryNodes = document.DocumentNode.SelectNodes("//ul/li/a[@href]");
+    if (categoryNodes != null)
     {
-        foreach (var imageNode in imageNodes)
+        foreach (var categoryNode in categoryNodes)
         {
-            var imageUrl = imageNode.Attributes["src"].Value;
-            var absoluteUrl = new Uri(new Uri(url), imageUrl).AbsoluteUri;
+            var href = categoryNode.Attributes["href"].Value;
+            var absoluteUrl = new Uri(new Uri(url), href).AbsoluteUri;
 
-            if (!visitedImages.Contains(absoluteUrl))
+            if (Uri.IsWellFormedUriString(absoluteUrl, UriKind.Absolute))
             {
-                //Mark image URL as visited
-                visitedImages.Add(absoluteUrl);
-
-                var fileName = Path.GetFileName(absoluteUrl);
-                var filePath = Path.Combine(baseOutputDirectory, "images", fileName);
-
-                var imageBytes = await httpClient.GetByteArrayAsync(absoluteUrl);
-                Directory.CreateDirectory(Path.GetDirectoryName(filePath));
-                File.WriteAllBytesAsync(filePath, imageBytes);
-            }
-        }
-    }
-    ExtractDetaiPageUrls(document, url);
-}
-
-async Task DownloadCssAndJs(HtmlDocument document, string url, HttpClient httpClient)
-{
-    var resourceNodes = document.DocumentNode.SelectNodes("//link[@href] | //script[@src]");
-    if (resourceNodes != null)
-    {
-        foreach (var resourceNode in resourceNodes)
-        {
-            string resourceUrl;
-            if (resourceNode.Name == "link")
-            {
-                resourceUrl = resourceNode.Attributes["href"].Value;
-            }
-            else
-            {
-                resourceUrl = resourceNode.Attributes["src"].Value;
-            }
-
-            var absoluteUrl = new Uri(new Uri(url), resourceUrl).AbsoluteUri;
-
-            if (!visitedResources.Contains(absoluteUrl))
-            {
-                //Mark resource URL as visited
-                visitedResources.Add(absoluteUrl);
-
-                var fileName = Path.GetFileName(absoluteUrl);
-                var filePath = Path.Combine(baseOutputDirectory, "resources", fileName);
-
-
-                var resourceBytes = await httpClient.GetByteArrayAsync(absoluteUrl);
-                Directory.CreateDirectory(Path.GetDirectoryName(filePath));
-                File.WriteAllBytesAsync(filePath, resourceBytes);
+                categoryUrls.Add(absoluteUrl);
             }
         }
     }
@@ -239,9 +224,8 @@ void ExtractDetaiPageUrls(HtmlDocument document, string url)
     }
 }
 
-void UpdateHtmlContent(HtmlDocument htmlDocument)
+void UpdateHtmlContent(HtmlDocument htmlDocument, string dir)
 {
-    //Update image URLs
     var imageNodes = htmlDocument.DocumentNode.SelectNodes("//img[@src]");
     if (imageNodes != null)
     {
@@ -250,51 +234,204 @@ void UpdateHtmlContent(HtmlDocument htmlDocument)
             var imageUrl = imageNode.Attributes["src"].Value;
             var localImagePath = Path.Combine(baseOutputDirectory, "images", Path.GetFileName(imageUrl));
 
-            //Update the src attribute to point to the local copy
             imageNode.SetAttributeValue("src", localImagePath);
         }
     }
 
-    //Update CSS URLs
-    var linkNodes = htmlDocument.DocumentNode.SelectNodes("//link[@href]");
-    if (linkNodes != null)
+    var hrefNodes = htmlDocument.DocumentNode.SelectNodes("//link[@href]");
+    if (hrefNodes != null)
     {
-        foreach (var linkNode in linkNodes)
+        foreach (var hrefNode in hrefNodes)
         {
-            var cssUrl = linkNode.Attributes["href"].Value;
-            var localCssPath = Path.Combine(baseOutputDirectory, "resources", Path.GetFileName(cssUrl));
+            var url = hrefNode.Attributes["href"].Value;
+            var localPath = Path.Combine(dir, Path.GetFileName(url));
 
-            //Update the href attribute to point to the local copy
-            linkNode.SetAttributeValue("href", localCssPath);
+            hrefNode.SetAttributeValue("href", localPath);
+        }
+    }
+
+    var headNode = htmlDocument.DocumentNode.SelectSingleNode("//head");
+    if (headNode != null)
+    {
+        var resourceNodes = htmlDocument.DocumentNode.SelectNodes("//link[@href] | //script[@src]");
+        if (resourceNodes != null)
+        {
+            foreach (var resourceNode in resourceNodes)
+            {
+                string resourceUrl;
+                string localCssPath;
+                if (resourceNode.Name == "link")
+                {
+                    resourceUrl = resourceNode.Attributes["href"].Value;
+                    localCssPath = Path.Combine(baseOutputDirectory, "resources", Path.GetFileName(resourceUrl));
+                    resourceNode.SetAttributeValue("href", localCssPath);
+                }
+                else
+                {
+                    resourceUrl = resourceNode.Attributes["src"].Value;
+                    localCssPath = Path.Combine(baseOutputDirectory, "resources", Path.GetFileName(resourceUrl));
+                    resourceNode.SetAttributeValue("src", localCssPath);
+                }
+
+            }
+        }
+    }
+
+}
+
+void UpdateProgressBar(int total, int completed)
+{
+    double progressPercentage = (double)completed / total;
+    Console.CursorLeft = 0;
+    Console.Write("Progress: [");
+    int progressWidth = 50;
+    int progressBarPosition = (int)(progressPercentage * progressWidth);
+    for (int i = 0; i < progressWidth; i++)
+    {
+        Console.Write(i < progressBarPosition ? "=" : " ");
+    }
+    Console.Write($"] {progressPercentage:P0}");
+    if (completed >= total)
+    {
+        Console.WriteLine("\nScraping completed.");
+    }
+}
+
+public static class ImageDownloader
+{
+    private static HashSet<string> visitedImages = new HashSet<string>();
+    private static readonly object visitedImagesLock = new object();
+
+    public static async Task DownloadImages(HtmlDocument document, string url, HttpClient httpClient, string baseOutputDirectory)
+    {
+        try
+        {
+            var imageNodes = document.DocumentNode.SelectNodes("//img[@src]");
+            if (imageNodes != null)
+            {
+                foreach (var imageNode in imageNodes)
+                {
+                    var imageUrl = imageNode.Attributes["src"].Value;
+                    var absoluteUrl = new Uri(new Uri(url), imageUrl).AbsoluteUri;
+
+                    lock (visitedImagesLock)
+                    {
+                        if (!visitedImages.Contains(absoluteUrl))
+                        {
+                            visitedImages.Add(absoluteUrl);
+                        }
+                        else
+                        {
+                            continue;
+                        }
+                    }
+
+                    var fileName = Path.GetFileName(absoluteUrl);
+                    var filePath = Path.Combine(baseOutputDirectory, "images", fileName);
+
+                    HttpResponseMessage response;
+                    using (response = await httpClient.GetAsync(absoluteUrl))
+                    {
+                        if (!response.IsSuccessStatusCode)
+                            continue;
+
+                        using (var content = await response.Content.ReadAsStreamAsync())
+                        {
+                            //Ensure file operations are thread-safe
+                            lock (visitedImagesLock)
+                            {
+                                Directory.CreateDirectory(Path.GetDirectoryName(filePath));
+                            }
+
+                            //Write to file outside of the lock
+                            using (var fileStream = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None))
+                            {
+                                await content.CopyToAsync(fileStream);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine(ex);
         }
     }
 }
-void UpdateProgressBar()
+
+public static class ResourceDownloader
 {
-    double imagesProgress = Math.Min((double)visitedImages.Count / totalImages, 1.0);
-    double pagesProgress = Math.Min((double)visitedPages.Count / totalPages.Count, 1.0);
-    double detailPagesProgress = Math.Min((double)visitedDetailPages.Count / totalDetailPages, 1.0);
+    private static HashSet<string> visitedResource = new HashSet<string>();
+    private static readonly object visitedResourceLock = new object();
 
-    double overallProgress = (imagesProgress + pagesProgress + detailPagesProgress) / 3;
-
-    lock (consoleLock)
+    public static async Task DownloadCssAndJs(HtmlDocument document, string url, HttpClient httpClient, string baseOutputDirectory)
     {
-        if (Math.Abs(overallProgress - lastProgress) >= 0.01)
+        try
         {
-            lastProgress = overallProgress;
-            Console.Clear();
-            Console.Write("\r[");
-            int progressWidth = 50;
-            int progressBarPosition = (int)(overallProgress * progressWidth);
-            for (int i = 0; i < progressWidth; i++)
+            var headNode = document.DocumentNode.SelectSingleNode("//head");
+            if (headNode != null)
             {
-                if (i < progressBarPosition)
-                    Console.Write("=");
-                else
-                    Console.Write(" ");
+                var resourceNodes = document.DocumentNode.SelectNodes("//link[@href] | //script[@src]");
+                if (resourceNodes != null)
+                {
+                    foreach (var resourceNode in resourceNodes)
+                    {
+                        string resourceUrl;
+                        if (resourceNode.Name == "link")
+                        {
+                            resourceUrl = resourceNode.Attributes["href"].Value;
+                        }
+                        else
+                        {
+                            resourceUrl = resourceNode.Attributes["src"].Value;
+                        }
+
+                        var absoluteUrl = new Uri(new Uri(url), resourceUrl).AbsoluteUri;
+
+                        lock (visitedResourceLock)
+                        {
+                            if (!visitedResource.Contains(absoluteUrl))
+                            {
+                                visitedResource.Add(absoluteUrl);
+                            }
+                            else
+                            {
+                                continue;
+                            }
+                        }
+                        var fileName = Path.GetFileName(absoluteUrl);
+                        var filePath = Path.Combine(baseOutputDirectory, "resources", fileName);
+
+                        HttpResponseMessage response;
+                        using (response = await httpClient.GetAsync(absoluteUrl))
+                        {
+                            if (!response.IsSuccessStatusCode)
+                                continue;
+
+                            using (var content = await response.Content.ReadAsStreamAsync())
+                            {
+                                //Ensure file operations are thread-safe
+                                lock (visitedResourceLock)
+                                {
+                                    Directory.CreateDirectory(Path.GetDirectoryName(filePath));
+                                }
+
+                                //Write to file outside of the lock
+                                using (var fileStream = new FileStream(filePath, FileMode.Create, FileAccess.Write, FileShare.None))
+                                {
+                                    await content.CopyToAsync(fileStream);
+                                }
+                            }
+                        }
+                    }
+                }
             }
-            Console.Write($"] {overallProgress:P0}");
-            Console.Out.Flush();
+
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine(ex);
         }
     }
 }
