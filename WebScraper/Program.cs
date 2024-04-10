@@ -1,6 +1,5 @@
 ﻿using HtmlAgilityPack;
 using System.Collections.Concurrent;
-using System.Text;
 
 string baseOutputDirectory;
 do
@@ -18,7 +17,7 @@ var categoryUrls = new ConcurrentBag<string>();
 //ProgressBar
 int totalTasks = 0;
 int completedTasks = 0;
-object progressLock = new object();
+object progressLock = new();
 
 
 var baseProductPages = new ConcurrentBag<String>();
